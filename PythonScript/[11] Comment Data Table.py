@@ -1,68 +1,96 @@
+import os
 import pandas as pd
+import numpy as np
 
-# 1. 파일 경로 설정 (앞서 병합된 최종 파일)
+# =========================================================
+# 1) Load race–lap dataset (already aggregated + event markers)
+# =========================================================
 file_path = '/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity/AnalysisResults/f1_race_lap_analysis_with_event.xlsx'
-
-# 2. 데이터 로드
-print("데이터 로드 중...")
 df = pd.read_excel(file_path)
+df.columns = df.columns.str.strip()
 
-# 분석할 이벤트 변수들과 커뮤니티 지표 설정
-# comment_count: 댓글 수
-# avg_text_len: 평균 댓글 길이
-# avg_time_gap: 평균 댓글 간격 (초 단위, 낮을수록 화력이 셈)
+print(f"Loaded: {file_path}")
+print(f"Rows (race-lap): {len(df)}")
+
+# =========================================================
+# 2) Columns to analyze
+# =========================================================
 event_vars = ['ev_unexp', 'ev_resp', 'ev_out']
 metrics = ['comment_count', 'avg_text_len', 'avg_time_gap']
 
-# 결과 담을 리스트
-summary_list = []
+missing_events = [c for c in event_vars if c not in df.columns]
+missing_metrics = [c for c in metrics if c not in df.columns]
 
-print("\n[이벤트별 영향력 분석 결과]")
-print("=" * 60)
+if missing_events:
+    raise ValueError(f"Missing event columns: {missing_events}")
+if missing_metrics:
+    raise ValueError(f"Missing metric columns: {missing_metrics}")
 
-for event in event_vars:
-    # 해당 이벤트 컬럼이 데이터에 있는지 확인
-    if event in df.columns:
-        # 0(미발생)과 1(발생)로 그룹화하여 평균 계산
-        grouped = df.groupby(event)[metrics].mean()
+# Ensure events are 0/1 ints
+for c in event_vars:
+    df[c] = df[c].fillna(0)
+    # sometimes events may be floats; coerce safely
+    df[c] = (df[c].astype(float) > 0).astype(int)
 
-        # 보기 좋게 출력
-        print(f"\n>> {event} (0: 미발생, 1: 발생) 에 따른 평균값:")
-        print(grouped)
+# =========================================================
+# 3) Build summary table: mean(metrics) by event occurrence (0/1)
+# =========================================================
+print("\n[이벤트별 영향력 요약표 생성]")
 
-        # 결과를 데이터프레임 형태로 정리해서 저장용 리스트에 추가
-        diff_df = grouped.copy()
-        diff_df['Event_Type'] = event
-        summary_list.append(diff_df)
-    else:
-        print(f"\n[Warning] '{event}' 컬럼이 데이터에 없습니다.")
+summary_rows = []
 
-print("\n" + "=" * 60)
+for ev in event_vars:
+    # group means
+    g = df.groupby(ev)[metrics].mean(numeric_only=True)
 
-# 3. 통합 요약표 만들기 (엑셀 저장용)
-if summary_list:
-    # 깔끔하게 다시 정리
-    export_df = pd.DataFrame()
+    # also include counts for transparency
+    counts = df[ev].value_counts(dropna=False).to_dict()
+    n0 = int(counts.get(0, 0))
+    n1 = int(counts.get(1, 0))
 
-    for event in event_vars:
-        if event in df.columns:
-            # 그룹화 및 인덱스 리셋
-            temp = df.groupby(event)[metrics].mean().reset_index()
+    # ensure both 0 and 1 rows exist (fill if not)
+    if 0 not in g.index:
+        g.loc[0] = [np.nan] * len(metrics)
+    if 1 not in g.index:
+        g.loc[1] = [np.nan] * len(metrics)
 
-            # 컬럼명 통일 (ev_unexp, ev_resp -> Is_Occurred)
-            temp.rename(columns={event: 'Is_Occurred'}, inplace=True)
+    g = g.sort_index()
 
-            # 이벤트 타입 명시
-            temp['Event_Type'] = event
+    # reshape to long rows
+    for occurred in [0, 1]:
+        row = {
+            'Event_Type': ev,
+            'Is_Occurred': occurred,
+            'N': n1 if occurred == 1 else n0,
+        }
+        for m in metrics:
+            row[m] = float(g.loc[occurred, m]) if pd.notna(g.loc[occurred, m]) else np.nan
+        summary_rows.append(row)
 
-            # 통합 데이터프레임에 추가
-            export_df = pd.concat([export_df, temp])
+    # add diff row (1 - 0)
+    diff_row = {
+        'Event_Type': ev,
+        'Is_Occurred': 'Diff(1-0)',
+        'N': n1,  # keep N1 for reference
+    }
+    for m in metrics:
+        v1 = g.loc[1, m]
+        v0 = g.loc[0, m]
+        diff_row[m] = float(v1 - v0) if (pd.notna(v1) and pd.notna(v0)) else np.nan
+    summary_rows.append(diff_row)
 
-    # 컬럼 순서 재배치 (avg_time_gap 포함)
-    export_df = export_df[['Event_Type', 'Is_Occurred', 'comment_count', 'avg_text_len', 'avg_time_gap']]
+export_df = pd.DataFrame(summary_rows)
 
-    # 저장
-    save_path = '/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity/AnalysisResults/f1_event_impact_summary.xlsx'
-    export_df.to_excel(save_path, index=False)
-    print(f"\n요약 결과가 저장되었습니다: {save_path}")
-    print(export_df)
+# column order
+export_df = export_df[['Event_Type', 'Is_Occurred', 'N', 'comment_count', 'avg_text_len', 'avg_time_gap']]
+
+# =========================================================
+# 4) Save
+# =========================================================
+out_dir = os.path.dirname(file_path)
+save_path = os.path.join(out_dir, 'f1_event_impact_summary.xlsx')
+export_df.to_excel(save_path, index=False)
+
+print("\n저장 완료:", save_path)
+print("\n미리보기:")
+print(export_df.head(12))

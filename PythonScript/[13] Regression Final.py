@@ -1,93 +1,156 @@
-import pandas as pd
-import statsmodels.api as sm
-from statsmodels.formula.api import ols
 import os
+import numpy as np
+import pandas as pd
+from statsmodels.formula.api import logit
 
 # =========================================================
-# 1. 설정 및 데이터 로드
+# 1. Load
 # =========================================================
-# 방금 만든 통합 데이터셋 경로
-base_dir = '/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity'
-input_path = os.path.join(base_dir, 'AnalysisResults/f1_race_lap_full_dataset.xlsx')
-output_txt_path = os.path.join(base_dir, 'AnalysisResults/f1_final_regression_report.txt')
+csv_path = "/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity/EmotionAnalysis/f1_community_prediction_result.csv"
+out_path = os.path.join(os.path.dirname(csv_path), "f1_comment_level_logit_report.txt")
 
-print(f"데이터 로드 중: {input_path}")
-df = pd.read_excel(input_path)
-
-# 컬럼명 공백 제거 (오류 방지)
+df = pd.read_csv(csv_path)
 df.columns = df.columns.str.strip()
 
-# 데이터 확인
-print(f"총 데이터 개수: {len(df)}개 (Race-Lap 단위)")
-print(f"컬럼 목록: {list(df.columns)}")
+print(f"Loaded: {csv_path}")
+print(f"Rows: {len(df):,}")
+print("Columns:", list(df.columns))
 
 # =========================================================
-# 2. 회귀분석 함수 정의
+# 2. Required columns (adjust if your names differ)
 # =========================================================
-results_summary = []
+# text column guess
+TEXT_COL_CANDIDATES = ["text", "comment", "content", "body"]
+text_col = next((c for c in TEXT_COL_CANDIDATES if c in df.columns), None)
+if text_col is None:
+    raise ValueError(f"Cannot find text column. Tried: {TEXT_COL_CANDIDATES}")
 
+# timestamp column guess
+TS_COL_CANDIDATES = ["timestamp", "time", "created_at", "datetime", "date"]
+ts_col = next((c for c in TS_COL_CANDIDATES if c in df.columns), None)
+if ts_col is None:
+    raise ValueError(f"Cannot find timestamp column. Tried: {TS_COL_CANDIDATES}")
 
-def run_regression(target_col, title):
-    print(f"\n--- Analyzing: {target_col} ({title}) ---")
+# event dummies must exist (or you can create from event_type later)
+for col in ["ev_unexp", "ev_resp", "ev_out"]:
+    if col not in df.columns:
+        raise ValueError(f"Missing required event column: {col} (need it for regression)")
 
-    # 1. 데이터 유효성 검사
-    if target_col not in df.columns:
-        print(f"[Skip] 컬럼 '{target_col}'이 데이터에 없습니다.")
+# =========================================================
+# 3. Preprocess
+# =========================================================
+df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=False)
+df = df.dropna(subset=[ts_col, text_col])
+
+# Basic controls
+df["comment_length"] = df[text_col].astype(str).str.len()
+df["hour"] = df[ts_col].dt.hour
+df["dow"] = df[ts_col].dt.dayofweek  # 0=Mon
+
+# If event columns are not strictly 0/1, coerce them
+for col in ["ev_unexp", "ev_resp", "ev_out"]:
+    df[col] = (df[col].fillna(0).astype(float) > 0).astype(int)
+
+# =========================================================
+# 4. Build binary emotion targets
+#    Case A: already has emotion one-hot columns (anger/happiness/...)
+#    Case B: has a single label column like emotion_target or emotion
+# =========================================================
+EMO_ONEHOT = ["anger", "happiness", "surprise", "sadness", "fear", "disgust"]
+
+onehot_available = [c for c in EMO_ONEHOT if c in df.columns]
+
+if len(onehot_available) >= 2:
+    # Use existing one-hot columns
+    targets = onehot_available
+    # Ensure 0/1
+    for t in targets:
+        df[t] = (df[t].fillna(0).astype(float) > 0).astype(int)
+
+else:
+    # Try label column
+    LABEL_COL_CANDIDATES = ["emotion_target", "emotion", "pred_emotion", "label"]
+    label_col = next((c for c in LABEL_COL_CANDIDATES if c in df.columns), None)
+    if label_col is None:
+        raise ValueError(
+            "No one-hot emotion columns found, and no label column found. "
+            f"Tried labels: {LABEL_COL_CANDIDATES}"
+        )
+
+    # Normalize labels to string
+    df[label_col] = df[label_col].astype(str).str.strip().str.lower()
+
+    # Map common label variants -> canonical names
+    label_map = {
+        "angry": "anger",
+        "anger": "anger",
+        "happy": "happiness",
+        "happiness": "happiness",
+        "joy": "happiness",
+        "surprise": "surprise",
+        "sad": "sadness",
+        "sadness": "sadness",
+        "fear": "fear",
+        "disgust": "disgust",
+    }
+    df["_emo"] = df[label_col].map(label_map)
+
+    targets = []
+    for emo in EMO_ONEHOT:
+        col = f"is_{emo}"
+        df[col] = (df["_emo"] == emo).astype(int)
+        targets.append(col)
+
+print("Binary targets:", targets)
+
+# =========================================================
+# 5. Run Logit per emotion
+# =========================================================
+results = []
+
+def run_logit(target_col: str, title: str):
+    # Drop NA and check variation (need both 0 and 1)
+    d = df.dropna(subset=[target_col, "ev_unexp", "ev_resp", "ev_out", "comment_length"])
+    if d[target_col].nunique() < 2:
+        print(f"[Skip] {target_col}: no variation (all same)")
         return
 
-    # 2. 회귀식 정의 (Target ~ X1 + X2 + X3 + Control)
-    # 독립변수: ev_unexp(예상밖), ev_resp(책임), ev_out(리타이어)
-    # 통제변수: comment_count (댓글이 많을수록 감정이 격해질 수 있으므로 통제)
-    formula = f"{target_col} ~ ev_unexp + ev_resp + ev_out + comment_count"
+    # Model: emotion ~ event dummies + controls
+    formula = f"{target_col} ~ ev_unexp + ev_resp + ev_out + comment_length + C(hour) + C(dow)"
 
-    # 3. 모델 적합 (OLS)
-    try:
-        model = ols(formula, data=df).fit()
+    model = logit(formula, data=d).fit(disp=False)
 
-        # 4. 결과 저장
-        summary_text = f"\n{'=' * 60}\n[Model] {title}\nFormula: {formula}\n{'=' * 60}\n"
-        summary_text += model.summary().as_text() + "\n\n"
-        results_summary.append(summary_text)
+    # Console summary (key terms)
+    print(f"\n--- {title} ---")
+    print(f"N={len(d):,} | McFadden R²={model.prsquared:.5f}")
+    for term in ["ev_unexp", "ev_resp", "ev_out"]:
+        coef = model.params.get(term, np.nan)
+        pval = model.pvalues.get(term, np.nan)
+        oratio = float(np.exp(coef)) if np.isfinite(coef) else np.nan
+        star = "*" if (np.isfinite(pval) and pval < 0.05) else ""
+        print(f" - {term}: coef={coef:.4f}, OR={oratio:.3f}, p={pval:.4g} {star}")
 
-        # 5. 핵심 결과 콘솔 출력 (유의한 변수만)
-        print(f"R-squared: {model.rsquared:.3f}")
-        for term in ['ev_unexp', 'ev_resp', 'ev_out']:
-            coef = model.params.get(term, 0)
-            pval = model.pvalues.get(term, 1)
-            star = "*" if pval < 0.05 else ""
-            print(f" - {term}: Coef = {coef:.4f} (P = {pval:.4f}) {star}")
+    # Save full table
+    block = []
+    block.append("\n" + "=" * 80)
+    block.append(f"[Logit] {title}")
+    block.append(f"Formula: {formula}")
+    block.append("=" * 80)
+    block.append(model.summary().as_text())
+    block.append("\n")
+    results.append("\n".join(block))
 
-    except Exception as e:
-        print(f"회귀분석 중 오류 발생: {e}")
-
-
-# =========================================================
-# 3. 분석 실행
-# =========================================================
-
-# (1) 댓글 간격 (화력/Speed) 예측
-# -> 간격이 줄어들수록(- Coef) 화력이 센 것임
-run_regression('avg_time_gap', 'Impact on Comment Speed (Time Gap)')
-
-# (2) 주요 감정 비율 예측
-# 어떤 이벤트가 어떤 감정을 자극하는지 확인
-run_regression('prop_anger', 'Impact on Anger Proportion')
-run_regression('prop_happiness', 'Impact on Happiness Proportion')
-run_regression('prop_surprise', 'Impact on Surprise Proportion')
-run_regression('prop_sadness', 'Impact on Sadness Proportion')
-run_regression('prop_fear', 'Impact on Fear Proportion')
-run_regression('prop_disgust', 'Impact on Disgust Proportion')
+# Run
+for t in targets:
+    title = t.replace("is_", "").upper()
+    run_logit(t, f"Event impact on {title}")
 
 # =========================================================
-# 4. 결과 파일 저장
+# 6. Save report
 # =========================================================
-if results_summary:
-    with open(output_txt_path, "w", encoding="utf-8") as f:
-        f.writelines(results_summary)
-
-    print("-" * 30)
-    print(f"전체 분석 리포트가 저장되었습니다: {output_txt_path}")
-    print("팁: P-value(P>|t|)가 0.05보다 작은 항목의 Coef(계수)를 확인하세요.")
-    print("    (양수면 증가, 음수면 감소)")
+if results:
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(results))
+    print(f"\nSaved: {out_path}")
 else:
-    print("분석 결과가 없습니다.")
+    print("\nNo results to save (all skipped).")
