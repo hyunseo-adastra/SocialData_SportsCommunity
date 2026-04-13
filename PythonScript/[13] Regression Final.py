@@ -1,156 +1,89 @@
-import os
-import numpy as np
 import pandas as pd
-from statsmodels.formula.api import logit
+import numpy as np
+import glob
+import os
+import statsmodels.formula.api as smf
 
 # =========================================================
-# 1. Load
+# 1. 경로 및 데이터 로드 (기존 로직 유지)
 # =========================================================
-csv_path = "/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity/EmotionAnalysis/f1_community_prediction_result.csv"
-out_path = os.path.join(os.path.dirname(csv_path), "f1_comment_level_logit_report.txt")
+base_path = '/Users/chohyunseo/Desktop/SocialData_SportsAnalysis/SocialData_SportsCommunity'
+event_file = os.path.join(base_path, 'EventLogData/F1 Event Data.xlsx')
+emo_path = os.path.join(base_path, 'EmotionResults')
+tox_path = os.path.join(base_path, 'ToxicityResults')
 
-df = pd.read_csv(csv_path)
-df.columns = df.columns.str.strip()
+try:
+    events = pd.read_excel(event_file)
+    events['unexpected'] = pd.to_numeric(events['unexpected'], errors='coerce').fillna(0).astype(int)
+    events['importance'] = pd.to_numeric(events['importance'], errors='coerce').fillna(0).astype(int)
+    events['lap_num'] = pd.to_numeric(events['lap'], errors='coerce')
+    event_summary = events.dropna(subset=['lap_num', 'race']).groupby(['race', 'lap_num']).agg({
+        'unexpected': 'max',
+        'importance': 'max'
+    }).reset_index()
+except Exception as e:
+    print(f"❌ 이벤트 로드 오류: {e}")
+    exit()
 
-print(f"Loaded: {csv_path}")
-print(f"Rows: {len(df):,}")
-print("Columns:", list(df.columns))
+races = ['Bahrain', 'Australia', 'Japan', 'Imola', 'Spain', 'United_Kingdom',
+         'Hungary', 'Netherlands', 'Singapore', 'Las_Vegas', 'Qatar', 'Abu_Dhabi']
 
-# =========================================================
-# 2. Required columns (adjust if your names differ)
-# =========================================================
-# text column guess
-TEXT_COL_CANDIDATES = ["text", "comment", "content", "body"]
-text_col = next((c for c in TEXT_COL_CANDIDATES if c in df.columns), None)
-if text_col is None:
-    raise ValueError(f"Cannot find text column. Tried: {TEXT_COL_CANDIDATES}")
+all_data = []
+for race in races:
+    e_file = os.path.join(emo_path, f'Community_{race}_Emotion_Scores.csv')
+    t_file = os.path.join(tox_path, f'Community_{race}_Toxicity_Scores.csv')
+    if os.path.exists(e_file) and os.path.exists(t_file):
+        df_e = pd.read_csv(e_file)
+        df_t = pd.read_csv(t_file)
+        df_race = pd.concat([df_e, df_t[['Toxicity_Score']]], axis=1)
+        df_race['race'] = race
+        df_race['post_timestamp'] = pd.to_datetime(df_race['post_timestamp'])
+        df_race = df_race.sort_values('post_timestamp')
+        diff_prev = df_race['post_timestamp'].diff().dt.total_seconds()
+        diff_next = df_race['post_timestamp'].diff(-1).abs().dt.total_seconds()
+        df_race['custom_interval'] = (diff_prev.fillna(diff_next) + diff_next.fillna(diff_prev)) / 2
+        df_race = pd.merge(df_race, event_summary, left_on=['race', 'LapNumber'], right_on=['race', 'lap_num'], how='left')
+        all_data.append(df_race)
 
-# timestamp column guess
-TS_COL_CANDIDATES = ["timestamp", "time", "created_at", "datetime", "date"]
-ts_col = next((c for c in TS_COL_CANDIDATES if c in df.columns), None)
-if ts_col is None:
-    raise ValueError(f"Cannot find timestamp column. Tried: {TS_COL_CANDIDATES}")
+df_total = pd.concat(all_data, axis=0, ignore_index=True)
+df_total = df_total.dropna(subset=['LapNumber']).copy() # 경기 중 데이터 필터링
 
-# event dummies must exist (or you can create from event_type later)
-for col in ["ev_unexp", "ev_resp", "ev_out"]:
-    if col not in df.columns:
-        raise ValueError(f"Missing required event column: {col} (need it for regression)")
-
-# =========================================================
-# 3. Preprocess
-# =========================================================
-df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=False)
-df = df.dropna(subset=[ts_col, text_col])
-
-# Basic controls
-df["comment_length"] = df[text_col].astype(str).str.len()
-df["hour"] = df[ts_col].dt.hour
-df["dow"] = df[ts_col].dt.dayofweek  # 0=Mon
-
-# If event columns are not strictly 0/1, coerce them
-for col in ["ev_unexp", "ev_resp", "ev_out"]:
-    df[col] = (df[col].fillna(0).astype(float) > 0).astype(int)
-
-# =========================================================
-# 4. Build binary emotion targets
-#    Case A: already has emotion one-hot columns (anger/happiness/...)
-#    Case B: has a single label column like emotion_target or emotion
-# =========================================================
-EMO_ONEHOT = ["anger", "happiness", "surprise", "sadness", "fear", "disgust"]
-
-onehot_available = [c for c in EMO_ONEHOT if c in df.columns]
-
-if len(onehot_available) >= 2:
-    # Use existing one-hot columns
-    targets = onehot_available
-    # Ensure 0/1
-    for t in targets:
-        df[t] = (df[t].fillna(0).astype(float) > 0).astype(int)
-
-else:
-    # Try label column
-    LABEL_COL_CANDIDATES = ["emotion_target", "emotion", "pred_emotion", "label"]
-    label_col = next((c for c in LABEL_COL_CANDIDATES if c in df.columns), None)
-    if label_col is None:
-        raise ValueError(
-            "No one-hot emotion columns found, and no label column found. "
-            f"Tried labels: {LABEL_COL_CANDIDATES}"
-        )
-
-    # Normalize labels to string
-    df[label_col] = df[label_col].astype(str).str.strip().str.lower()
-
-    # Map common label variants -> canonical names
-    label_map = {
-        "angry": "anger",
-        "anger": "anger",
-        "happy": "happiness",
-        "happiness": "happiness",
-        "joy": "happiness",
-        "surprise": "surprise",
-        "sad": "sadness",
-        "sadness": "sadness",
-        "fear": "fear",
-        "disgust": "disgust",
-    }
-    df["_emo"] = df[label_col].map(label_map)
-
-    targets = []
-    for emo in EMO_ONEHOT:
-        col = f"is_{emo}"
-        df[col] = (df["_emo"] == emo).astype(int)
-        targets.append(col)
-
-print("Binary targets:", targets)
+# 변수 생성
+df_total['unexpected'] = df_total['unexpected'].fillna(0).astype(int)
+df_total['importance'] = df_total['importance'].fillna(0).astype(int)
+df_total['lap_norm'] = df_total.groupby('race')['LapNumber'].transform(lambda x: x / (x.max() if x.max() > 0 else 1))
+df_total['is_toxic'] = (df_total['Toxicity_Score'] >= 0.5).astype(int)
+df_total['comment_len'] = df_total['processed_text'].astype(str).apply(len)
 
 # =========================================================
-# 5. Run Logit per emotion
+# 5. 회귀 분석 및 출력 (4대 감정 포함)
 # =========================================================
-results = []
+def print_paper_format(model_res, title):
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+    print(model_res.summary().tables[1])
+    r2 = getattr(model_res, 'rsquared', getattr(model_res, 'prsquared', 'N/A'))
+    print(f"R-squared: {r2:.3f}" if isinstance(r2, float) else f"R-squared: {r2}")
+    print(f"N: {int(model_res.nobs):,}")
 
-def run_logit(target_col: str, title: str):
-    # Drop NA and check variation (need both 0 and 1)
-    d = df.dropna(subset=[target_col, "ev_unexp", "ev_resp", "ev_out", "comment_length"])
-    if d[target_col].nunique() < 2:
-        print(f"[Skip] {target_col}: no variation (all same)")
-        return
+# (1) 댓글 간격 분석
+res_interval = smf.ols('custom_interval ~ unexpected + importance + lap_norm + comment_len', data=df_total).fit()
+print_paper_format(res_interval, "표 n. 종속변수: 댓글 간격 (종목 F)")
 
-    # Model: emotion ~ event dummies + controls
-    formula = f"{target_col} ~ ev_unexp + ev_resp + ev_out + comment_length + C(hour) + C(dow)"
+# (2) 4대 주요 감정 선형 회귀 (Anger, Happiness, Disgust, Surprise)
+# LABEL_0: Anger, LABEL_3: Happiness, LABEL_1: Disgust, LABEL_5: Surprise
+target_emotions = [
+    ('Anger', 'LABEL_0'),
+    ('Happiness', 'LABEL_3'),
+    ('Disgust', 'LABEL_1'),
+    ('Surprise', 'LABEL_5')
+]
 
-    model = logit(formula, data=d).fit(disp=False)
+for name, col in target_emotions:
+    res_emo = smf.ols(f'{col} ~ unexpected + importance + lap_norm', data=df_total).fit()
+    print_paper_format(res_emo, f"종목 F {name} 감정 분석 결과")
 
-    # Console summary (key terms)
-    print(f"\n--- {title} ---")
-    print(f"N={len(d):,} | McFadden R²={model.prsquared:.5f}")
-    for term in ["ev_unexp", "ev_resp", "ev_out"]:
-        coef = model.params.get(term, np.nan)
-        pval = model.pvalues.get(term, np.nan)
-        oratio = float(np.exp(coef)) if np.isfinite(coef) else np.nan
-        star = "*" if (np.isfinite(pval) and pval < 0.05) else ""
-        print(f" - {term}: coef={coef:.4f}, OR={oratio:.3f}, p={pval:.4g} {star}")
-
-    # Save full table
-    block = []
-    block.append("\n" + "=" * 80)
-    block.append(f"[Logit] {title}")
-    block.append(f"Formula: {formula}")
-    block.append("=" * 80)
-    block.append(model.summary().as_text())
-    block.append("\n")
-    results.append("\n".join(block))
-
-# Run
-for t in targets:
-    title = t.replace("is_", "").upper()
-    run_logit(t, f"Event impact on {title}")
-
-# =========================================================
-# 6. Save report
-# =========================================================
-if results:
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(results))
-    print(f"\nSaved: {out_path}")
-else:
-    print("\nNo results to save (all skipped).")
+# (3) 독성 로지스틱 회귀
+res_toxic = smf.logit('is_toxic ~ unexpected + importance + lap_norm + comment_len', data=df_total).fit()
+print_paper_format(res_toxic, "종목 F 독성 분석 결과 (Logit)")
+print("\n--- Odds Ratios (오즈비) ---")
+print(np.exp(res_toxic.params))
