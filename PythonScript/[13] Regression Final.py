@@ -149,7 +149,7 @@ def print_paper_format(model_res, title):
     if isinstance(r2, float):
         print(f"{r2_label}: {r2:.4f}")
 
-    print(f"Log-Likelihood: {log_like:.2f}")
+    print(f"Log-Likelihood: {log_like:.3f}")
 
     # 로지스틱 회귀인 경우 AIC와 모델 유의성 추가 출력
     if hasattr(model_res, 'prsquared'):
